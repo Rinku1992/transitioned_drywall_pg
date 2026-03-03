@@ -1,26 +1,62 @@
-# DO NOT include azure-functions-worker in this file
-# The Python Worker is managed by Azure Functions platform
-# Manually managing azure-functions-worker may cause unexpected issues
+service_drywall_account_key: &service_drywall_account_key prj-fbm-drywall-dev-397b5755cf2f.json
+service_compute_account_key: &service_compute_account_key prj-fbm-drywall-dev-ee657d61c363.json
 
-google-cloud-storage
-google-cloud-secret-manager
-asyncpg
-vertexai==1.43.0
-google-auth
-google-oauth
-pathlib
-pypdf
-pdf2image
-pydantic
-python-multipart
-pandas
-openpyxl
-scikit-image
-opencv-python
-numpy
-ruamel-yaml
-matplotlib
-pygltflib
-pillow
-fastapi
-uvicorn
+VertexAI:
+    service_account_key: *service_drywall_account_key
+    llm:
+        model_name: gemini-2.5-flash
+        region: nearest
+        available_regions:
+            - us-central1: [41.2586, -95.9378]
+            - us-east1: [33.1960, -80.0131]
+            - us-east4: [39.0438, -77.4874]
+            - us-east5: [40.7306, -73.9352]
+            - us-south1: [29.4241, -98.4936]
+            - us-west1: [45.5231, -122.6765]
+            - us-west4: [36.1699, -115.1398]
+            - northamerica-northeast1: [45.5017, -73.5673]
+            - europe-central2: [52.2297, 21.0122]
+            - europe-north1: [60.1699, 24.9384]
+            - europe-southwest1: [40.4168, -3.7038]
+            - europe-west1: [50.8503, 4.3517]
+            - europe-west2: [51.5074, -0.1278]
+            - europe-west3: [50.1109, 8.6821]
+            - europe-west4: [53.3498, -6.2603]
+            - europe-west8: [45.4642, 9.1900]
+            - europe-west9: [48.8566, 2.3522]
+            - asia-northeast1: [35.6895, 139.6917]
+            - asia-northeast3: [37.5665, 126.9780]
+            - asia-south1: [19.0760, 72.8777]
+            - asia-southeast1: [1.3521, 103.8198]
+            - australia-southeast1: [-33.8688, 151.2093]
+        parameters:
+            temperature: 0
+        max_retry: 5
+
+PostgreSQL:
+    host: 10.132.0.3
+    port: 5432
+    database: drywall_takeoff
+    user: postgres
+    password: Drywall@2026
+    min_pool_size: 2
+    max_pool_size: 10
+    table_name_projects: projects
+    table_name_plans: plans
+    table_name_models: models
+    table_name_sku: sku
+    table_name_model_revisions_2d: model_revisions_2d
+    table_name_model_revisions_3d: model_revisions_3d
+
+CloudStorage:
+    bucket_name: drywall-takeoff-artifacts-dev
+    expiration_in_minutes: 15
+
+CloudRun:
+    origins_cors:
+        - http://localhost:5172
+        - http://localhost:5173
+        - https://prj-fbm-drywall-dev.web.app
+    APIs:
+        floorplan_to_structured_2d: https://floorplan-to-structured-2d-pg-460679066182.us-central1.run.app
+        wall_detector: https://wall-detector-460679066182.us-central1.run.app
