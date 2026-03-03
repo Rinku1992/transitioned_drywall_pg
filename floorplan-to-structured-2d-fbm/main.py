@@ -7,6 +7,7 @@ import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.encoders import jsonable_encoder
 from concurrent.futures import ThreadPoolExecutor
 
 import google.auth.transport.requests
@@ -16,8 +17,13 @@ from modeller_2d import FloorPlan2D
 from helper import (
     enable_logging_on_stdout,
     create_pg_pool,
+    pg_fetch_all,
+    pg_fetch_one,
+    pg_execute,
     log_json,
     timed_step,
+    parse_jsonb,
+    get_gcs_client,
     load_vertex_ai_client,
     load_gcp_credentials,
     load_hyperparameters,
@@ -29,12 +35,44 @@ from helper import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def respond_with_UI_payload(payload, status_code=200):
     return JSONResponse(
-        content=json.loads(json.dumps(payload)),
+        content=jsonable_encoder(payload),
         status_code=status_code,
         media_type="application/json",
     )
+
+
+def validate_required(params: dict, required_fields: list, endpoint: str, rid: str):
+    missing = [f for f in required_fields if not params.get(f)]
+    if missing:
+        log_json("WARNING", "VALIDATION_FAILED", request_id=rid, endpoint=endpoint,
+                 missing_fields=missing)
+        return False, respond_with_UI_payload(
+            dict(error=f"Missing required fields: {', '.join(missing)}"),
+            status_code=400
+        )
+    return True, None
+
+
+def require_pool(pool, endpoint: str, rid: str):
+    if pool is None:
+        log_json("ERROR", "POOL_UNAVAILABLE", request_id=rid, endpoint=endpoint)
+        return respond_with_UI_payload(
+            dict(error="Database unavailable. Please try again later."),
+            status_code=503
+        )
+    return None
+
+
+def get_params(request_query_params, body):
+    merged = dict(body) if body else {}
+    merged.update(dict(request_query_params))
+    return merged
 
 
 def floorplan_to_walls(credentials, project_id, plan_id, user_id, page_number, output_path=None):
@@ -76,6 +114,8 @@ def floorplan_to_walls(credentials, project_id, plan_id, user_id, page_number, o
 app = FastAPI(title="Floorplan-to-Structured-2D (Cloud Run)")
 
 CREDENTIALS = load_gcp_credentials()
+HYPERPARAMETERS = load_hyperparameters()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CREDENTIALS["CloudRun"]["origins_cors"],
@@ -84,22 +124,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Module-level singletons
 pg_pool = None
+VERTEX_AI_CLIENT = None
+VERTEX_AI_GENERATION_CONFIG = None
+VERTEX_AI_MAX_RETRY = None
+DRYWALL_TEMPLATES = None
 
 
 @app.on_event("startup")
 async def startup():
-    global pg_pool
+    global pg_pool, VERTEX_AI_CLIENT, VERTEX_AI_GENERATION_CONFIG, VERTEX_AI_MAX_RETRY, DRYWALL_TEMPLATES
+
+    # 1. PostgreSQL pool
     try:
         pg_pool = await create_pg_pool(CREDENTIALS)
         if pg_pool:
-            log_json("INFO", "STARTUP_SUCCESS", detail="PostgreSQL pool created successfully")
+            log_json("INFO", "STARTUP_PG_SUCCESS", detail="PostgreSQL pool created")
         else:
-            log_json("WARNING", "STARTUP_DEGRADED", detail="PostgreSQL pool is None — DB operations will fail")
+            log_json("WARNING", "STARTUP_PG_DEGRADED", detail="PostgreSQL pool is None")
     except Exception as exc:
-        log_json("ERROR", "STARTUP_FAILED", error=f"{type(exc).__name__}: {exc}",
-                 detail="Service starting without DB — endpoints requiring DB will return 503")
+        log_json("ERROR", "STARTUP_PG_FAILED", error=f"{type(exc).__name__}: {exc}")
         pg_pool = None
+
+    # 2. Vertex AI client (loaded once, reused for all requests)
+    try:
+        VERTEX_AI_CLIENT, VERTEX_AI_GENERATION_CONFIG = load_vertex_ai_client(CREDENTIALS)
+        VERTEX_AI_MAX_RETRY = CREDENTIALS["VertexAI"]["llm"]["max_retry"]
+        log_json("INFO", "STARTUP_VERTEX_AI_SUCCESS",
+                 model=CREDENTIALS["VertexAI"]["llm"]["model_name"])
+    except Exception as exc:
+        log_json("ERROR", "STARTUP_VERTEX_AI_FAILED", error=f"{type(exc).__name__}: {exc}")
+
+    # 3. Load drywall templates (SKU data — rarely changes, cache at startup)
+    if pg_pool:
+        try:
+            DRYWALL_TEMPLATES = await load_templates(pg_pool, CREDENTIALS)
+            log_json("INFO", "STARTUP_TEMPLATES_LOADED", count=len(DRYWALL_TEMPLATES))
+        except Exception as exc:
+            log_json("ERROR", "STARTUP_TEMPLATES_FAILED", error=f"{type(exc).__name__}: {exc}")
+            DRYWALL_TEMPLATES = []
+
+    # 4. GCS client singleton
+    get_gcs_client()
+
+    log_json("INFO", "STARTUP_COMPLETE")
 
 
 @app.on_event("shutdown")
@@ -121,16 +190,27 @@ async def floorplan_to_2d(request: Request):
     enable_logging_on_stdout()
     log_json("INFO", "REQUEST_START", request_id=rid, endpoint="/floorplan_to_structured_2d")
 
-    parameters = dict(request.query_params)
+    pool_err = require_pool(pg_pool, "/floorplan_to_structured_2d", rid)
+    if pool_err:
+        return pool_err
+
+    params = get_params(request.query_params, None)
     try:
         body = await request.json()
+        params = get_params(request.query_params, body)
     except Exception:
-        body = dict()
-    project_id = parameters.get("project_id") or body.get("project_id")
-    user_id = parameters.get("user_id") or body.get("user_id")
-    plan_id = parameters.get("plan_id") or body.get("plan_id")
-    page_number = parameters.get("page_number") or body.get("page_number")
-    verbose = parameters.get("verbose") or body.get("verbose")
+        pass
+
+    valid, err = validate_required(params, ["project_id", "user_id", "plan_id", "page_number"],
+                                   "/floorplan_to_structured_2d", rid)
+    if not valid:
+        return err
+
+    project_id = params["project_id"]
+    user_id = params["user_id"]
+    plan_id = params["plan_id"]
+    page_number = params["page_number"]
+    page_number_padded = str(page_number).zfill(2)
 
     log_json("INFO", "REQUEST_PARAMS", request_id=rid,
              project_id=project_id, plan_id=plan_id, user_id=user_id, page_number=page_number)
@@ -138,17 +218,14 @@ async def floorplan_to_2d(request: Request):
     # --- Step 1: Download processed floorplan from GCS ---
     async with timed_step("download_floorplan", request_id=rid, page_number=page_number):
         floor_plan_processed_path = download_floorplan(
-            user_id, plan_id, project_id, CREDENTIALS, str(page_number).zfill(2)
+            user_id, plan_id, project_id, CREDENTIALS, page_number_padded
         )
 
-    # --- Step 2: Initialize AI models ---
-    async with timed_step("init_ai_models", request_id=rid):
-        hyperparameters = load_hyperparameters()
-        vertex_ai_client, generation_config = load_vertex_ai_client(CREDENTIALS)
-        floor_plan_modeller_2d = FloorPlan2D(
-            hyperparameters,
-            (vertex_ai_client, generation_config, CREDENTIALS["VertexAI"]["llm"]["max_retry"])
-        )
+    # --- Step 2: Use cached AI models ---
+    floor_plan_modeller_2d = FloorPlan2D(
+        HYPERPARAMETERS,
+        (VERTEX_AI_CLIENT, VERTEX_AI_GENERATION_CONFIG, VERTEX_AI_MAX_RETRY)
+    )
 
     # --- Step 3: Parallel wall detection + transcription ---
     async with timed_step("parallel_wall_detect_and_transcribe", request_id=rid, page_number=page_number):
@@ -161,12 +238,12 @@ async def floorplan_to_2d(request: Request):
                 plan_id,
                 user_id,
                 page_number,
-                output_path=f"/tmp/{project_id}/{plan_id}/{user_id}/floor_plan_wall_segmented_{str(page_number).zfill(2)}.png"
+                output_path=f"/tmp/{project_id}/{plan_id}/{user_id}/floor_plan_wall_segmented_{page_number_padded}.png"
             )
             futures["transcriber"] = executor.submit(
                 transcribe,
                 CREDENTIALS,
-                hyperparameters,
+                HYPERPARAMETERS,
                 floor_plan_processed_path,
             )
         wall_segmented_path = futures["floorplan_to_walls"].result()
@@ -174,14 +251,18 @@ async def floorplan_to_2d(request: Request):
 
     # --- Step 4: Upload wall segmented image ---
     async with timed_step("upload_wall_segmented", request_id=rid):
-        upload_floorplan(wall_segmented_path, plan_id, project_id, CREDENTIALS, index=str(page_number).zfill(2))
+        upload_floorplan(wall_segmented_path, plan_id, project_id, CREDENTIALS, index=page_number_padded)
 
     log_json("INFO", "STEP_COMPLETE", request_id=rid, step="wall_detection_and_transcription",
              page_number=page_number)
 
-    # --- Step 5: Load drywall templates from DB ---
-    async with timed_step("load_templates", request_id=rid):
-        DRYWALL_TEMPLATES = await load_templates(pg_pool, CREDENTIALS)
+    # --- Step 5: Use cached drywall templates ---
+    templates = DRYWALL_TEMPLATES
+    if not templates:
+        # Fallback: reload if startup cache failed
+        log_json("WARNING", "TEMPLATES_CACHE_MISS", request_id=rid,
+                 detail="Reloading templates from DB")
+        templates = await load_templates(pg_pool, CREDENTIALS)
 
     # --- Step 6: Generate 2D model ---
     walls_2d, polygons, metadata, floorplan_baseline_page_source = None, None, None, None
@@ -189,16 +270,16 @@ async def floorplan_to_2d(request: Request):
         async with timed_step("model_2d_generation", request_id=rid, page_number=page_number):
             walls_2d, polygons, walls_2d_path, external_contour = floor_plan_modeller_2d.model(
                 image_path=wall_segmented_path,
-                model_2d_path=f"/tmp/{project_id}/{plan_id}/{user_id}/walls_2d_{str(page_number).zfill(2)}.json",
+                model_2d_path=f"/tmp/{project_id}/{plan_id}/{user_id}/walls_2d_{page_number_padded}.json",
                 floor_plan_path=floor_plan_processed_path,
                 transcription_block_with_centroids=transcription_block_with_centroids,
                 transcription_headers_and_footers=transcription_headers_and_footers,
-                drywall_templates=DRYWALL_TEMPLATES,
+                drywall_templates=templates,
             )
 
         if walls_2d and polygons:
             async with timed_step("load_drywall_choices", request_id=rid):
-                floor_plan_modeller_2d.load_drywall_choices(walls_2d, polygons, DRYWALL_TEMPLATES)
+                floor_plan_modeller_2d.load_drywall_choices(walls_2d, polygons, templates)
                 floor_plan_modeller_2d.load_ceiling_choices(polygons)
 
             async with timed_step("save_and_upload_2d_plots", request_id=rid):
@@ -206,19 +287,19 @@ async def floorplan_to_2d(request: Request):
                     walls_2d_path, floor_plan_path=floor_plan_processed_path
                 )
                 upload_floorplan(model_2d_path, plan_id, project_id, CREDENTIALS,
-                                index=str(page_number).zfill(2))
+                                index=page_number_padded)
 
                 floorplan_baseline, floorplan_page_statistics = floor_plan_modeller_2d.scale_to(
                     floor_plan_path=floor_plan_processed_path
                 )
                 floorplan_baseline_page_source = upload_floorplan(
                     floorplan_baseline, plan_id, project_id, CREDENTIALS,
-                    index=str(page_number).zfill(2)
+                    index=page_number_padded
                 )
 
             drywall_choices_color_codes = {
                 drywall_template["sku_variant"]: drywall_template["color_code"][::-1]
-                for drywall_template in DRYWALL_TEMPLATES
+                for drywall_template in templates
             }
             drywall_choices_color_codes.update(dict(DISABLED=[255, 0, 0]))
             metadata = dict(
@@ -233,6 +314,9 @@ async def floorplan_to_2d(request: Request):
                 scales_architectural=floor_plan_modeller_2d.scales_architectural,
                 drywall_choices_color_codes=drywall_choices_color_codes,
             )
+    else:
+        log_json("WARNING", "WALL_SEGMENTATION_EMPTY", request_id=rid, page_number=page_number,
+                 detail="floor_plan_modeller_2d.is_none returned True — no walls detected")
 
     # --- Step 7: Insert 2D model into PostgreSQL ---
     async with timed_step("insert_model_2d", request_id=rid, page_number=page_number):
@@ -254,30 +338,4 @@ async def floorplan_to_2d(request: Request):
              page_number=page_number,
              has_walls=walls_2d is not None,
              has_polygons=polygons is not None)
-```
-
----
-
-### Key changes explained:
-
-**1. Startup lifecycle** — Pool created in `@app.on_event("startup")` with try/except, matching service 1's pattern.
-
-**2. `load_templates` is now async** — call changed from `load_templates(bigquery_client, CREDENTIALS)` to `await load_templates(pg_pool, CREDENTIALS)`.
-
-**3. `insert_model_2d` is now async** — call changed from sync to `await insert_model_2d(...)`. Also note the signature change: `bigquery_client` → `pg_pool` (the `target_drywalls` param moves to where `GCS_URL_target_drywalls_page` was, which in this service is `floorplan_baseline_page_source`).
-
-**4. Removed `google.cloud.secretmanager` import** — was imported but never used in the original.
-
-**5. Every heavy step wrapped in `timed_step`** — when you look at Cloud Logging, you'll see the full request journey:
-```
-STEP_START  → download_floorplan          (rid=abc123)
-STEP_COMPLETE → download_floorplan        duration_ms=1200
-STEP_START  → parallel_wall_detect_and_transcribe
-STEP_COMPLETE → parallel_wall_detect...   duration_ms=15400
-STEP_START  → load_templates
-STEP_COMPLETE → load_templates            duration_ms=28
-STEP_START  → model_2d_generation
-STEP_COMPLETE → model_2d_generation       duration_ms=45000
-STEP_START  → insert_model_2d
-STEP_COMPLETE → insert_model_2d           duration_ms=35
-REQUEST_COMPLETE → /floorplan_to_structured_2d  total_duration_ms=62500
+    return respond_with_UI_payload(dict(status="success", page_number=page_number))
