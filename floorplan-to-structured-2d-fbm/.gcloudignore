@@ -1,0 +1,29 @@
+# .gcloudignore
+# Override .gitignore for Cloud Build — we NEED the service account JSON keys
+
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv
+venv/
+env/
+node_modules/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+*.svg
+output/
+walls_2d.json
+walls_3d.json
+checkpoint-*/
+*.pth
+*.safetensors
+*.bin
+*.pkl
+
+# NOTE: *.json is NOT listed here — JSON service account keys MUST be included in the build
