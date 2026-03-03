@@ -24,7 +24,6 @@ from transcriber import Transcriber
 # ---------------------------------------------------------------------------
 
 def log_json(severity: str, message: str, **kwargs):
-    """Emit a single structured JSON log line to stdout (Cloud Logging compatible)."""
     payload = {"severity": severity, "message": message}
     payload.update(kwargs)
     print(json.dumps(payload, default=str), flush=True)
@@ -32,7 +31,6 @@ def log_json(severity: str, message: str, **kwargs):
 
 @asynccontextmanager
 async def timed_step(step_name: str, request_id: str = "", **extra):
-    """Async context manager that logs step duration on exit."""
     start = time.perf_counter()
     log_json("INFO", "STEP_START", step=step_name, request_id=request_id, **extra)
     error_msg = None
@@ -52,11 +50,51 @@ async def timed_step(step_name: str, request_id: str = "", **extra):
 
 
 # ---------------------------------------------------------------------------
+# Configuration Loaders (called once at startup, cached)
+# ---------------------------------------------------------------------------
+
+def load_gcp_credentials() -> dict:
+    yaml = YAML(typ="safe", pure=True)
+    with open("gcp.yaml", 'r') as f:
+        credentials = yaml.load(f)
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials["service_drywall_account_key"]
+    return credentials
+
+
+def load_hyperparameters() -> dict:
+    yaml = YAML(typ="safe", pure=True)
+    with open("hyperparameters.yaml", 'r') as f:
+        hyperparameters = yaml.load(f)
+    return hyperparameters
+
+
+def enable_logging_on_stdout():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='{"severity": "%(levelname)s", "message": "%(message)s"}',
+        stream=sys.stdout
+    )
+
+
+# ---------------------------------------------------------------------------
+# GCS Client (shared singleton)
+# ---------------------------------------------------------------------------
+
+_gcs_client = None
+
+def get_gcs_client() -> CloudStorageClient:
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = CloudStorageClient()
+        log_json("INFO", "GCS_CLIENT_CREATED")
+    return _gcs_client
+
+
+# ---------------------------------------------------------------------------
 # PostgreSQL Connection Pool
 # ---------------------------------------------------------------------------
 
 async def create_pg_pool(credentials) -> asyncpg.Pool:
-    """Create and return an asyncpg connection pool with graceful error handling."""
     pg_config = credentials["PostgreSQL"]
     try:
         pool = await asyncpg.create_pool(
@@ -79,7 +117,7 @@ async def create_pg_pool(credentials) -> asyncpg.Pool:
 
 
 # ---------------------------------------------------------------------------
-# Core DB Helpers (with built-in observability)
+# Core DB Helpers
 # ---------------------------------------------------------------------------
 
 async def pg_fetch_all(pool, query, params=None, query_name="unnamed"):
@@ -128,18 +166,28 @@ async def pg_execute(pool, query, params=None, query_name="unnamed"):
 
 
 # ---------------------------------------------------------------------------
-# Database Operations (migrated from BigQuery)
+# JSONB Helper
+# ---------------------------------------------------------------------------
+
+def parse_jsonb(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Database Operations
 # ---------------------------------------------------------------------------
 
 async def insert_model_2d(
     model_2d, scale, page_number, plan_id, user_id, project_id,
     target_drywalls, pool, credentials
 ):
-    """Upsert a 2D model into the models table.
-    BQ MERGE → PG INSERT ... ON CONFLICT.
-    Note: This service's version does NOT have the 'source' column param
-    (unlike drywall-takeoff-3d's version which has both source + target_drywalls).
-    """
     page_number = int(page_number)
 
     if not model_2d.get("metadata", None):
@@ -150,9 +198,10 @@ async def insert_model_2d(
             [project_id, plan_id, page_number],
             query_name="insert_model_2d__fetch_metadata"
         )
-        if row and row["metadata"] is not None:
-            metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"]
-            model_2d["metadata"] = metadata
+        if row:
+            metadata = parse_jsonb(row["metadata"])
+            if metadata:
+                model_2d["metadata"] = metadata
 
     model_2d_json = json.dumps(model_2d)
     scale = scale or ''
@@ -184,9 +233,7 @@ async def insert_model_2d(
 
 
 async def load_templates(pool, credentials):
-    """Load SKU/drywall templates from the sku table.
-    Returns jsonable_encoder-compatible list of template dicts.
-    """
+    """Load SKU/drywall templates from the sku table."""
     rows = await pg_fetch_all(pool, "SELECT * FROM sku", query_name="load_templates")
 
     product_templates_target = list()
@@ -208,35 +255,11 @@ async def load_templates(pool, credentials):
 
 
 # ---------------------------------------------------------------------------
-# Non-DB Helpers (unchanged logic)
+# Non-DB Helpers
 # ---------------------------------------------------------------------------
 
-def enable_logging_on_stdout():
-    """Kept for backward compatibility but now also configures structured format."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='{"severity": "%(levelname)s", "message": "%(message)s"}',
-        stream=sys.stdout
-    )
-
-
-def load_gcp_credentials() -> dict:
-    yaml = YAML(typ="safe", pure=True)
-    with open("gcp.yaml", 'r') as f:
-        credentials = yaml.load(f)
-    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials["service_drywall_account_key"]
-    return credentials
-
-
-def load_hyperparameters() -> dict:
-    yaml = YAML(typ="safe", pure=True)
-    with open("hyperparameters.yaml", 'r') as f:
-        hyperparameters = yaml.load(f)
-    return hyperparameters
-
-
 def download_floorplan(user_id, plan_id, project_id, credentials, index, destination_path="/tmp/floor_plan_wall_processed.png"):
-    client = CloudStorageClient()
+    client = get_gcs_client()
     bucket = client.bucket(credentials["CloudStorage"]["bucket_name"])
     blob_path = f"{project_id.lower()}/{plan_id.lower()}/{index}/floor_plan.png"
     blob = bucket.blob(blob_path)
@@ -248,7 +271,7 @@ def download_floorplan(user_id, plan_id, project_id, credentials, index, destina
 
 
 def upload_floorplan(plan_path, plan_id, project_id, credentials, index=None, directory=None):
-    client = CloudStorageClient()
+    client = get_gcs_client()
     page_number = Path(plan_path.stem).suffix
     if page_number:
         blob_object_name = Path(str(plan_path).replace(page_number, '')).name
@@ -297,15 +320,16 @@ def phoenix_call(generate_content_lambda, max_retry=5, base_delay=1.0, pydantic_
             return response.text
         except (ResourceExhausted, ServiceUnavailable, DeadlineExceeded) as e:
             n_iterations += 1
+            log_json("WARNING", "PHOENIX_CALL_RETRY", attempt=n_iterations,
+                     max_retry=max_retry, error=str(e), reason="rate_limit_or_unavailable")
             if n_iterations >= max_retry:
                 raise e
             sleep_time = base_delay * (2 ** (n_iterations - 1)) + uniform(0, 0.5)
             sleep(sleep_time)
-            logging.warning(f"SYSTEM: {e}: RETRYING ...")
         except Exception as e:
             n_iterations += 1
+            log_json("WARNING", "PHOENIX_CALL_RETRY", attempt=n_iterations,
+                     max_retry=max_retry, error=str(e), reason="parse_or_generation_error")
             if n_iterations >= max_retry:
                 raise e
             temperature = min(0.5 * (n_iterations + 1) / max_retry, 0.5)
-            logging.warning(f"SYSTEM: Response Generation/Parsing failed with ERROR: {e}")
-            logging.warning(f"SYSTEM: RETRYING with TEMPERATURE: {temperature}")
