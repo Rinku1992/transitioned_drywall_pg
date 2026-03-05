@@ -257,7 +257,8 @@ def ensure_not_nan(v: float) -> float:
 class DrywallAssembly(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    material: str
+    # material: str
+    material: Union[str, dict]
     color_code: Tuple[int, int, int]
     thickness: float
     layers: int
