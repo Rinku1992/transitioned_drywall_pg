@@ -320,25 +320,28 @@ async def floorplan_to_2d(request: Request):
                  detail="floor_plan_modeller_2d.is_none returned True — no walls detected")
 
    # --- Step 7: Insert 2D model into PostgreSQL ---
-    # Fire-and-forget: background task so ASGI cancellation cannot kill the DB write
-    async def _safe_insert():
-        try:
-            await insert_model_2d(
-                dict(walls_2d=walls_2d, polygons=polygons, metadata=metadata),
-                floor_plan_modeller_2d.normalize_scale(floor_plan_modeller_2d.scale),
-                page_number,
-                plan_id,
-                user_id,
-                project_id,
-                floorplan_baseline_page_source,
-                pg_pool,
-                CREDENTIALS
-            )
-            log_json("INFO", "INSERT_MODEL_2D_BACKGROUND_SUCCESS",
-                     request_id=rid, page_number=page_number)
-        except Exception as e:
-            log_json("ERROR", "INSERT_MODEL_2D_BACKGROUND_FAILED",
-                     request_id=rid, page_number=page_number, error=str(e))
+    # Shield from ASGI cancellation but still await completion
+    try:
+        await asyncio.shield(insert_model_2d(
+            dict(walls_2d=walls_2d, polygons=polygons, metadata=metadata),
+            floor_plan_modeller_2d.normalize_scale(floor_plan_modeller_2d.scale),
+            page_number,
+            plan_id,
+            user_id,
+            project_id,
+            floorplan_baseline_page_source,
+            pg_pool,
+            CREDENTIALS
+        ))
+        log_json("INFO", "INSERT_MODEL_2D_SUCCESS",
+                 request_id=rid, page_number=page_number)
+    except asyncio.CancelledError:
+        log_json("WARNING", "INSERT_MODEL_2D_SHIELDED",
+                 request_id=rid, page_number=page_number,
+                 detail="ASGI cancelled but DB write continues in background")
+    except Exception as e:
+        log_json("ERROR", "INSERT_MODEL_2D_FAILED",
+                 request_id=rid, page_number=page_number, error=f"{type(e).__name__}: {e}")
 
     asyncio.ensure_future(_safe_insert())
 
