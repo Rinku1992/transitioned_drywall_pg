@@ -208,30 +208,42 @@ async def insert_model_2d(
     scale = scale or ''
     target_drywalls = target_drywalls or ''
 
-    await pg_execute(
-        pool,
-        """
-        INSERT INTO models (
-            plan_id, project_id, user_id, page_number, scale,
-            model_2d, model_3d, takeoff, target_drywalls,
-            created_at, updated_at
-        ) VALUES (
-            $1, $2, $3, $4, $5,
-            $6::jsonb, '{}'::jsonb, '{}'::jsonb, $7,
-            NOW(), NOW()
-        )
-        ON CONFLICT (LOWER(project_id), LOWER(plan_id), page_number)
-        DO UPDATE SET
-            model_2d = EXCLUDED.model_2d,
-            scale = CASE WHEN EXCLUDED.scale = '' THEN models.scale ELSE EXCLUDED.scale END,
-            user_id = EXCLUDED.user_id,
-            updated_at = NOW()
-        """,
-        [plan_id, project_id, user_id, page_number, scale,
-         model_2d_json, target_drywalls],
-        query_name="insert_model_2d"
+    # Use a fresh direct connection instead of pool to avoid
+    # stale/dead connections after long Vertex AI processing
+    pg_config = credentials["PostgreSQL"]
+    conn = await asyncpg.connect(
+        host=pg_config["host"],
+        port=pg_config["port"],
+        database=pg_config["database"],
+        user=pg_config["user"],
+        password=pg_config["password"],
+        timeout=30,
     )
-
+    try:
+        status = await conn.execute(
+            """
+            INSERT INTO models (
+                plan_id, project_id, user_id, page_number, scale,
+                model_2d, model_3d, takeoff, target_drywalls,
+                created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6::jsonb, '{}'::jsonb, '{}'::jsonb, $7,
+                NOW(), NOW()
+            )
+            ON CONFLICT (LOWER(project_id), LOWER(plan_id), page_number)
+            DO UPDATE SET
+                model_2d = EXCLUDED.model_2d,
+                scale = CASE WHEN EXCLUDED.scale = '' THEN models.scale ELSE EXCLUDED.scale END,
+                user_id = EXCLUDED.user_id,
+                updated_at = NOW()
+            """,
+            plan_id, project_id, user_id, page_number, scale,
+            model_2d_json, target_drywalls,
+        )
+        log_json("INFO", "DB_EXECUTE", query="insert_model_2d", status=status)
+    finally:
+        await conn.close()
 
 async def load_templates(pool, credentials):
     """Load SKU/drywall templates from the sku table."""
