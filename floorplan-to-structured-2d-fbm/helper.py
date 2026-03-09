@@ -197,14 +197,26 @@ async def insert_model_2d(
     # After 5-15 min of Vertex AI processing, pool connections are
     # dead (killed by VPC connector). A fresh connection guarantees success.
     pg_config = credentials["PostgreSQL"]
-    conn = await asyncpg.connect(
-        host=pg_config["host"],
-        port=pg_config["port"],
-        database=pg_config["database"],
-        user=pg_config["user"],
-        password=pg_config["password"],
-        timeout=30,
-    )
+    conn = None
+    for attempt in range(3):
+        try:
+            conn = await asyncpg.connect(
+                host=pg_config["host"],
+                port=pg_config["port"],
+                database=pg_config["database"],
+                user=pg_config["user"],
+                password=pg_config["password"],
+                timeout=60,
+                command_timeout=60,
+            )
+            log_json("INFO", "DB_DIRECT_CONNECT_SUCCESS", attempt=attempt + 1)
+            break
+        except Exception as e:
+            log_json("WARNING", "DB_DIRECT_CONNECT_RETRY", attempt=attempt + 1,
+                     error=f"{type(e).__name__}: {e}")
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2)
     try:
         if not model_2d.get("metadata", None):
             row = await conn.fetchrow(
