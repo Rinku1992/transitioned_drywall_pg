@@ -265,6 +265,20 @@ async def floorplan_to_2d(request: Request):
                  detail="Reloading templates from DB")
         templates = await load_templates(pg_pool, CREDENTIALS)
 
+    # --- Step 5.5: Start DB keepalive during long Vertex AI processing ---
+    async def _pg_keepalive(interval=60):
+        """Ping PostgreSQL every 60s to prevent VPC connector from killing the route."""
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await pg_fetch_one(pg_pool, "SELECT 1", query_name="keepalive_ping")
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass  # Ignore failures, just keep trying
+
+    keepalive_task = asyncio.ensure_future(_pg_keepalive(60))
+    
     # --- Step 6: Generate 2D model ---
     walls_2d, polygons, metadata, floorplan_baseline_page_source = None, None, None, None
     if not floor_plan_modeller_2d.is_none(wall_segmented_path):
@@ -319,6 +333,10 @@ async def floorplan_to_2d(request: Request):
         log_json("WARNING", "WALL_SEGMENTATION_EMPTY", request_id=rid, page_number=page_number,
                  detail="floor_plan_modeller_2d.is_none returned True — no walls detected")
 
+    # --- Step 6.5: Stop keepalive ---
+    keepalive_task.cancel()
+
+    
    # --- Step 7: Insert 2D model into PostgreSQL ---
     # Shield from ASGI cancellation but still await completion
     try:
