@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from ruamel.yaml import YAML
 from time import sleep
 from random import uniform
-
+import asyncio
 import asyncpg
 import vertexai
 from vertexai.generative_models import GenerativeModel
