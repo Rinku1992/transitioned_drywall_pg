@@ -3,7 +3,9 @@ from pypdf import PdfReader, PdfWriter
 from pdf2image import convert_from_path
 import cv2
 from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
 
+Image.MAX_IMAGE_PIXELS = None
 
 def process_page(pdf_page, vector_page, image_path_page, vector_pdf_page):
     save(pdf_page, vector_page, image_path_page, vector_pdf_page)
@@ -34,7 +36,7 @@ def to_sharp(image_path_page):
 def preprocess(pdf_path, image_path="/tmp/floor_plan.png"):
     pages = convert_from_path(
         pdf_path,
-        dpi=400,
+        dpi=200,  # <--- FIX 1: Change this from 400 to 200
     )
     reader = PdfReader(pdf_path)
     image_path_pages = list()
@@ -54,6 +56,11 @@ def preprocess(pdf_path, image_path="/tmp/floor_plan.png"):
                     vector_pdf_page,
                 )
             )
+            image_path_pages.append(image_path_page)
+            vector_pdf_pages.append(vector_pdf_page)
+        [future.result() for future in futures]
+
+    return vector_pdf_pages, image_path_pages
             image_path_pages.append(image_path_page)
             vector_pdf_pages.append(vector_pdf_page)
         [future.result() for future in futures]
