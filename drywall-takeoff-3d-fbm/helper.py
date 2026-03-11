@@ -3,6 +3,7 @@ import hashlib
 import sys
 import os
 import time
+import re  # Added for bulletproof JSON extraction
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -360,9 +361,16 @@ def classify_plan(plan_path, vertex_ai_client_parameters):
                 generation_config=vertex_ai_generation_config,
             )
             response_text = response.text.strip()
-            if response_text.startswith("```"):
-                response_text = response_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-            classification = json.loads(response_text)
+            
+            # --- BULLETPROOF JSON EXTRACTION ---
+            # Finds the exact JSON block and ignores all conversational text or markdown
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if not json_match:
+                raise ValueError(f"No JSON object found in response: {response_text}")
+                
+            clean_json_string = json_match.group(0)
+            classification = json.loads(clean_json_string)
+            
             validated = ArchitecturalDrawingClassifierResponse(**classification)
             return validated.model_dump()
         except (ResourceExhausted, ServiceUnavailable, DeadlineExceeded) as e:
