@@ -716,32 +716,78 @@ async def floorplan_to_2d(request: Request):
     status = "COMPLETED"
     # Use module-level cached Vertex AI client
     vertex_ai_client_parameters = (VERTEX_AI_CLIENT, VERTEX_AI_GENERATION_CONFIG, VERTEX_AI_MAX_RETRY)
+    
+    # ---> HELPER FUNCTION FOR PARALLEL CLASSIFICATION & UPLOAD
+    def process_single_page(index, floor_plan_vector, floor_plan_path, creds):
+        p_type = classify_plan(floor_plan_path, vertex_ai_client_parameters)
+        baseline_src = upload_floorplan(floor_plan_vector, plan_id, project_id, creds, index=str(index).zfill(2))
+        page_src = upload_floorplan(floor_plan_path, plan_id, project_id, creds, index=str(index).zfill(2))
+        return p_type, baseline_src, page_src
+
     try:
         id_token = load_floorplan_to_structured_2d_ID_token(CREDENTIALS)
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # 1. Submit all pages for parallel classification & upload
             futures = list()
-            floorplan_baseline_page_sources = list()
-            floorplan_page_sources = list()
-            plan_types = list()
             for index, (floor_plan_vector, floor_plan_path) in enumerate(zip(floor_plan_paths_vector, floor_plan_paths_preprocessed)):
-                plan_type = classify_plan(floor_plan_path, vertex_ai_client_parameters)
-                plan_types.append(plan_type)
-                floorplan_baseline_page_source = upload_floorplan(floor_plan_vector, plan_id, project_id, CREDENTIALS, index=str(index).zfill(2))
-                floorplan_baseline_page_sources.append(floorplan_baseline_page_source)
-                floorplan_page_source = upload_floorplan(floor_plan_path, plan_id, project_id, CREDENTIALS, index=str(index).zfill(2))
-                floorplan_page_sources.append(floorplan_page_source)
-                if plan_type["plan_type"].upper().find("FLOOR") == -1:
-                    continue
                 futures.append(
+                    executor.submit(
+                        process_single_page,
+                        index, floor_plan_vector, floor_plan_path, CREDENTIALS
+                    )
+                )
+
+            # Wait for all background classification threads to finish
+            results = [future.result() for future in futures]
+            
+            # Unpack the results cleanly
+            plan_types = [r[0] for r in results]
+            floorplan_baseline_page_sources = [r[1] for r in results]
+            floorplan_page_sources = [r[2] for r in results]
+
+            # 2. Trigger downstream API requests in the background ONLY for valid floorplans
+            for index, plan_type in enumerate(plan_types):
+                if plan_type["plan_type"].upper().find("FLOOR") != -1:
                     executor.submit(
                         floorplan_to_structured_2d,
                         CREDENTIALS, id_token, project_id, plan_id, user_id, index
                     )
-                )
+
+            # 3. Enter the DB Polling Loop
             for page_number, (plan_type, _, floorplan_page_source) in enumerate(zip(plan_types, floorplan_baseline_page_sources, floorplan_page_sources)):
                 if plan_type["plan_type"].upper().find("FLOOR") == -1:
                     continue
                 timeout = from_unix_epoch() + 3600
+    # status = "COMPLETED"
+    # # Use module-level cached Vertex AI client
+    # vertex_ai_client_parameters = (VERTEX_AI_CLIENT, VERTEX_AI_GENERATION_CONFIG, VERTEX_AI_MAX_RETRY)
+    # try:
+    #     id_token = load_floorplan_to_structured_2d_ID_token(CREDENTIALS)
+    #     with ThreadPoolExecutor(max_workers=3) as executor:
+    #         futures = list()
+    #         floorplan_baseline_page_sources = list()
+    #         floorplan_page_sources = list()
+    #         plan_types = list()
+    #         for index, (floor_plan_vector, floor_plan_path) in enumerate(zip(floor_plan_paths_vector, floor_plan_paths_preprocessed)):
+    #             plan_type = classify_plan(floor_plan_path, vertex_ai_client_parameters)
+    #             plan_types.append(plan_type)
+    #             floorplan_baseline_page_source = upload_floorplan(floor_plan_vector, plan_id, project_id, CREDENTIALS, index=str(index).zfill(2))
+    #             floorplan_baseline_page_sources.append(floorplan_baseline_page_source)
+    #             floorplan_page_source = upload_floorplan(floor_plan_path, plan_id, project_id, CREDENTIALS, index=str(index).zfill(2))
+    #             floorplan_page_sources.append(floorplan_page_source)
+    #             if plan_type["plan_type"].upper().find("FLOOR") == -1:
+    #                 continue
+    #             futures.append(
+    #                 executor.submit(
+    #                     floorplan_to_structured_2d,
+    #                     CREDENTIALS, id_token, project_id, plan_id, user_id, index
+    #                 )
+    #             )
+    #         for page_number, (plan_type, _, floorplan_page_source) in enumerate(zip(plan_types, floorplan_baseline_page_sources, floorplan_page_sources)):
+    #             if plan_type["plan_type"].upper().find("FLOOR") == -1:
+    #                 continue
+    #             timeout = from_unix_epoch() + 3600
                 poll_count = 0
                 while from_unix_epoch() < timeout:
                     query_output = await pg_fetch_all(
