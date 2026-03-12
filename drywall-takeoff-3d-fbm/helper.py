@@ -60,7 +60,7 @@ async def timed_step(step_name: str, request_id: str = "", volume_context: dict 
             log_payload["error"] = error_msg
             log_json("ERROR", "STEP_FAILED", **log_payload)
         else:
-            log_json("INFO", "STEP_COMPLETE", **log_payload))
+            log_json("INFO", "STEP_COMPLETE", **log_payload)
 
 
 # ---------------------------------------------------------------------------
