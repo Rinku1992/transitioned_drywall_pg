@@ -35,10 +35,18 @@ def log_json(severity: str, message: str, **kwargs):
 
 
 @asynccontextmanager
-async def timed_step(step_name: str, request_id: str = "", **extra):
-    """Async context manager that logs step duration on exit."""
+async def timed_step(step_name: str, request_id: str = "", volume_context: dict = None, **extra):
+    """Async context manager that logs step duration on exit, with optional volume metrics."""
     start = time.perf_counter()
-    log_json("INFO", "STEP_START", step=step_name, request_id=request_id, **extra)
+    
+    # Build the base payload
+    log_payload = {"step": step_name, "request_id": request_id}
+    if volume_context:
+        log_payload["volume_context"] = volume_context
+    log_payload.update(extra)
+    
+    log_json("INFO", "STEP_START", **log_payload)
+    
     error_msg = None
     try:
         yield
@@ -47,12 +55,12 @@ async def timed_step(step_name: str, request_id: str = "", **extra):
         raise
     finally:
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_payload["duration_ms"] = duration_ms
         if error_msg:
-            log_json("ERROR", "STEP_FAILED", step=step_name, request_id=request_id,
-                     duration_ms=duration_ms, error=error_msg, **extra)
+            log_payload["error"] = error_msg
+            log_json("ERROR", "STEP_FAILED", **log_payload)
         else:
-            log_json("INFO", "STEP_COMPLETE", step=step_name, request_id=request_id,
-                     duration_ms=duration_ms, **extra)
+            log_json("INFO", "STEP_COMPLETE", **log_payload))
 
 
 # ---------------------------------------------------------------------------
