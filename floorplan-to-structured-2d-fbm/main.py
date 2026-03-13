@@ -98,8 +98,30 @@ def floorplan_to_walls(credentials, project_id, plan_id, user_id, page_number, o
             plan_id=plan_id,
             user_id=user_id,
             page_number=page_number
-        )
+        ),
+        timeout=300,
     )
+
+    # --- Validate wall detector response before writing to disk ---
+    if response.status_code != 200:
+        log_json("ERROR", "WALL_DETECTOR_FAILED",
+                 status_code=response.status_code,
+                 page_number=page_number,
+                 response_preview=response.text[:500])
+        raise RuntimeError(f"Wall detector returned HTTP {response.status_code}")
+
+    content_type = response.headers.get("content-type", "")
+    if "image" not in content_type:
+        log_json("ERROR", "WALL_DETECTOR_BAD_CONTENT_TYPE",
+                 content_type=content_type,
+                 page_number=page_number,
+                 response_preview=response.text[:500])
+        raise RuntimeError(f"Wall detector returned content-type '{content_type}', expected image")
+
+    if len(response.content) < 1000:
+        log_json("WARNING", "WALL_DETECTOR_SMALL_RESPONSE",
+                 page_number=page_number,
+                 content_length=len(response.content))
 
     if not output_path:
         output_path = Path("/tmp/floor_plan_wall_segmented.png")
