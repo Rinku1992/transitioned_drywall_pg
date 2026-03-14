@@ -60,4 +60,4 @@ CloudRun:
         - https://prj-fbm-drywall-dev.web.app
     APIs:
         floorplan_to_structured_2d: https://floorplan-to-structured-2d-pg-460679066182.us-central1.run.app
-        wall_detector: https://wall-detector-test-460679066182.us-central1.run.app
+        wall_detector: https://wall-detector-460679066182.us-central1.run.app
