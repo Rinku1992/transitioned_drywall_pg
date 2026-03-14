@@ -59,4 +59,4 @@ CloudRun:
         - http://localhost:5173
         - https://prj-fbm-drywall-dev.web.app
     APIs:
-        wall_detector: https://wall-detector-test-460679066182.us-central1.run.app
+        wall_detector: https://wall-detector-460679066182.us-central1.run.app
