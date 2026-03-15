@@ -921,9 +921,7 @@ class FloorPlan2D(FloorPlan):
             response, ceiling_height_and_scale = phoenix_call(
                 lambda temperature: self._vertex_ai_client.generate_content(
                     contents=contents,
-                    generation_config={**self._vertex_ai_generation_config, "temperature": temperature,
-                                      "response_mime_type": "application/json",
-                        "response_schema": ScaleAndCeilingHeightDetectorResponse.model_json_schema()},
+                    generation_config={**self._vertex_ai_generation_config, "temperature": temperature},
                 ),
                 max_retry=self._vertex_ai_max_retry,
                 pydantic_model=ScaleAndCeilingHeightDetectorResponse,
@@ -1097,9 +1095,7 @@ class FloorPlan2D(FloorPlan):
             _, model_polygon = phoenix_call(
                 lambda temperature: self._vertex_ai_client.generate_content(
                     contents=contents,
-                    generation_config={**self._vertex_ai_generation_config, "temperature": temperature,
-                                      "response_mime_type": "application/json",
-                        "response_schema": DrywallPredictorCaliforniaResponse.model_json_schema()},
+                    generation_config={**self._vertex_ai_generation_config, "temperature": temperature},
                 ),
                 max_retry=self._vertex_ai_max_retry,
                 pydantic_model=DrywallPredictorCaliforniaResponse,
