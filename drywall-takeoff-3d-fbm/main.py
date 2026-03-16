@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import math
 
-from preprocessing import preprocess
+from preprocessing import preprocess, reprocess_pages_hires
 from extrapolate_3d import Extrapolate3D
 from helper import (
     create_pg_pool,
@@ -679,7 +679,17 @@ async def floorplan_to_2d(request: Request):
             plan_types = [r[0] for r in results]
             floorplan_baseline_page_sources = [r[1] for r in results]
             floorplan_page_sources = [r[2] for r in results]
-
+            ### My Change
+            floor_indices = [i for i, pt in enumerate(plan_types) if pt["plan_type"].upper().find("FLOOR") != -1]
+            if floor_indices:
+                reprocess_pages_hires(pdf_path, floor_indices)
+                # Re-upload high-res versions for FLOOR pages
+                for fi in floor_indices:
+                    floorplan_page_sources[fi] = upload_floorplan(
+                        floor_plan_paths_preprocessed[fi], plan_id, project_id, CREDENTIALS,
+                        index=str(fi).zfill(2)
+                    )
+                    
             for index, plan_type in enumerate(plan_types):
                 if plan_type["plan_type"].upper().find("FLOOR") != -1:
                     executor.submit(
