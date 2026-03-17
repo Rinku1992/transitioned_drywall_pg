@@ -1084,9 +1084,7 @@ class FloorPlan2D(FloorPlan):
             candidates = extract_wall_dimension_candidates(
                 [X1, Y1, X2, Y2], nearest_transcription_blocks, pixel_aspect_ratio
             )
-            if candidates:
-                log_json("INFO", "DIMENSION_CANDIDATES", wall_index=i,
-                         candidates=len(candidates), top_confidence=candidates[0]["confidence"])
+            
         system = Content(role="model", parts=[Part.from_text(DRYWALL_PREDICTOR_CALIFORNIA.format(drywall_templates=drywall_templates))])
         _, canvas_buffer_array = cv2.imencode(".png", canvas_cropped)
         bytes_canvas = canvas_buffer_array.tobytes()
@@ -1102,7 +1100,12 @@ class FloorPlan2D(FloorPlan):
                 dimension_candidates=candidates
             )
             wall_specs.append(wall_spec)
-
+        total_candidates = sum(len(ws["dimension_candidates"]) for ws in wall_specs)
+        high_confidence = sum(1 for ws in wall_specs if ws["dimension_candidates"] and ws["dimension_candidates"][0]["confidence"] == "high")
+        log_json("INFO", "DIMENSION_PRECOMPUTE",
+                 total_walls=len(wall_specs),
+                 total_candidates=total_candidates,
+                 high_confidence_walls=high_confidence)
         polygon = dict(vertices=vertices.tolist(), perimeter_wall_lines=wall_specs, transcription_entries=transcription_entries)
        
         query = Content(role="user", parts=[
@@ -1119,12 +1122,23 @@ class FloorPlan2D(FloorPlan):
                 max_retry=self._vertex_ai_max_retry,
                 pydantic_model=DrywallPredictorCaliforniaResponse,
             )
+
+            log_json("INFO", "DRYWALL_PREDICTION_SUCCESS",
+                     room_name=model_polygon.get("ceiling", {}).get("room_name", ""),
+                     n_walls=len(model_polygon.get("wall_parameters", [])),
+                     ceiling_confidence=model_polygon.get("ceiling", {}).get("confidence", 0),
+                     wall_confidences=[w.get("confidence", 0) for w in model_polygon.get("wall_parameters", [])])
+            
             model_polygon["ceiling"]["area"] = verify_tolerance_area(model_polygon["ceiling"]["area"], area_target, model_polygon["ceiling"]["confidence"])
             for index, (dimension_wall_predicted, wall_unnormalized )in enumerate(zip(model_polygon["wall_parameters"], walls_unnormalized)):
                 dimension_wall_rectified = verify_tolerance_distance(dimension_wall_predicted, wall_unnormalized, dimension_wall_predicted["confidence"])
                 model_polygon["wall_parameters"][index] = dimension_wall_rectified
         except Exception as e:
-            logging.warning(f"SYSTEM: Drywall prediction for polygon: {json.dumps(polygon)} failed with error: {e}")
+            log_json("WARNING", "DRYWALL_PREDICTION_FAILED",
+                     error=str(e),
+                     n_walls=len(walls),
+                     n_transcription_entries=len(transcription_entries),
+                     n_dimension_candidates=sum(len(ws.get("dimension_candidates", [])) for ws in wall_specs))
             model_polygon = {
                 "ceiling": {
                     "room_name": '',
