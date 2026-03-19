@@ -1016,6 +1016,7 @@ class FloorPlan2D(FloorPlan):
         threshold=1000,
         tolerance=10,
         height_default=9.125,
+        base_canvas=None,
     ):
         def verify_tolerance_distance(dimension_wall, wall_unnormalized, confidence_score):
             try:
@@ -1053,27 +1054,24 @@ class FloorPlan2D(FloorPlan):
 
             return dimension_wall
 
-        def verify_tolerance_distance(dimension_wall, wall_unnormalized, confidence_score):
+        def verify_tolerance_area(area_polygon_predicted, area_polygon_target, confidence_score):
             try:
                 confidence_score = float(confidence_score)
             except (ValueError, TypeError):
                 confidence_score = 0.5
             try:
-                dimension_wall["length"] = float(dimension_wall["length"]) if dimension_wall.get("length") else 0.0
+                area_polygon_predicted = float(area_polygon_predicted) if area_polygon_predicted else 0.0
             except (ValueError, TypeError):
-                dimension_wall["length"] = 0.0
-            try:
-                dimension_wall["width"] = float(dimension_wall["width"]) if dimension_wall.get("width") else None
-            except (ValueError, TypeError):
-                dimension_wall["width"] = None
-            if dimension_wall["length"] and dimension_wall["width"] and confidence_score >= 0.95:
+                area_polygon_predicted = 0.0
+            if area_polygon_predicted and confidence_score >= 0.9:
                 return area_polygon_predicted
             if area_polygon_predicted and abs(area_polygon_target - area_polygon_predicted) > tolerance ** 2:
                 return area_polygon_target
 
             return area_polygon_predicted
 
-        canvas = cv2.imread(floor_plan_path)
+        # canvas = cv2.imread(floor_plan_path)
+        canvas = base_canvas.copy() if base_canvas is not None else cv2.imread(floor_plan_path)
         vertices = np.array(vertices)
         canvas_to_overlay = canvas.copy()
         cv2.fillPoly(canvas_to_overlay, pts=[vertices], color=(0, 0, 255))
@@ -1096,15 +1094,14 @@ class FloorPlan2D(FloorPlan):
         canvas_cropped = canvas[max(0, polygon_bounding_box_Y1 - threshold_Y): polygon_bounding_box_Y2 + threshold_Y, max(0, polygon_bounding_box_X1 - threshold_X): polygon_bounding_box_X2 + threshold_X]
         centroid_polygon_X = round(sum([vertex[0] for vertex in vertices]) / len(vertices))
         centroid_polygon_Y = round(sum([vertex[1] for vertex in vertices]) / len(vertices))
-       nearest_transcription_blocks = self._load_nearest_transcription_blocks((centroid_polygon_X, centroid_polygon_Y), transcription_block_with_centroids)
+        nearest_transcription_blocks = self._load_nearest_transcription_blocks((centroid_polygon_X, centroid_polygon_Y), transcription_block_with_centroids)
         transcription_entries = list()
         for transcription, centroid in nearest_transcription_blocks.items():
             transcription_entries.append(dict(text=transcription, centroid=dict(X=centroid[0], Y=centroid[1])))
 
         # Pre-compute dimension candidates for each wall
         pixel_aspect_ratio = self._hyperparameters["modelling"]["pixel_aspect_ratio"]
-        
-            
+                
         system = Content(role="model", parts=[Part.from_text(DRYWALL_PREDICTOR_CALIFORNIA.format(drywall_templates=drywall_templates))])
         _, canvas_buffer_array = cv2.imencode(".png", canvas_cropped)
         bytes_canvas = canvas_buffer_array.tobytes()
@@ -1127,7 +1124,6 @@ class FloorPlan2D(FloorPlan):
                  total_candidates=total_candidates,
                  high_confidence_walls=high_confidence)
         polygon = dict(vertices=vertices.tolist(), perimeter_wall_lines=wall_specs, transcription_entries=transcription_entries)
-       
         query = Content(role="user", parts=[
             Part.from_text(json.dumps(polygon)),
             Part.from_data(data=bytes_canvas, mime_type="image/png")
@@ -1142,7 +1138,6 @@ class FloorPlan2D(FloorPlan):
                 max_retry=self._vertex_ai_max_retry,
                 pydantic_model=DrywallPredictorCaliforniaResponse,
             )
-
             log_json("INFO", "DRYWALL_PREDICTION_SUCCESS",
                      room_name=model_polygon.get("ceiling", {}).get("room_name", ""),
                      n_walls=len(model_polygon.get("wall_parameters", [])),
@@ -1152,7 +1147,7 @@ class FloorPlan2D(FloorPlan):
             model_polygon["ceiling"]["area"] = verify_tolerance_area(model_polygon["ceiling"]["area"], area_target, model_polygon["ceiling"]["confidence"])
             for index, (dimension_wall_predicted, wall_unnormalized )in enumerate(zip(model_polygon["wall_parameters"], walls_unnormalized)):
                 dimension_wall_rectified = verify_tolerance_distance(dimension_wall_predicted, wall_unnormalized, dimension_wall_predicted["confidence"])
-            
+                
                 model_polygon["wall_parameters"][index] = dimension_wall_rectified
         except Exception as e:
             log_json("WARNING", "DRYWALL_PREDICTION_FAILED",
@@ -1224,6 +1219,7 @@ class FloorPlan2D(FloorPlan):
         transcription_block_with_centroids,
         index,
         shared_memory,
+        base_canvas=None,
     ):
         def load_wall_payload(wall_line):
             X1, Y1, X2, Y2 = wall_line[0]
@@ -1261,6 +1257,7 @@ class FloorPlan2D(FloorPlan):
             transcription_block_with_centroids,
             perimeter_walls_unnormalized,
             height_default=height_default,
+            base_canvas=base_canvas,
         )
 
         polygon_ids_drywall_interior = list()
@@ -2105,6 +2102,8 @@ class FloorPlan2D(FloorPlan):
         external_contour_normalized = [(round(scale_x * coordinate[0]), round(scale_y * coordinate[1])) for coordinate in external_contour]
         perimeter_lines, outer_drywall_surfaces = self.perimeter_lines(wall_lines)
         futures = list()
+        # Read floorplan image ONCE (instead of per-thread)
+        base_canvas = cv2.imread(floor_plan_path)
         with Manager() as manager:
             shared_memory = dict(walls_2d=manager.list(), polygons=manager.list(), lock=manager.Lock())
             with ThreadPoolExecutor(max_workers=8) as executor:
@@ -2131,6 +2130,7 @@ class FloorPlan2D(FloorPlan):
                         transcription_block_with_centroids,
                         index,
                         shared_memory,
+                        base_canvas, 
                     ))
                 [future.result() for future in futures]
                 futures = list()
@@ -2169,6 +2169,7 @@ class FloorPlan2D(FloorPlan):
                         transcription_block_with_centroids,
                         index,
                         shared_memory,
+                        base_canvas, 
                     ))
                 [future.result() for future in futures]
             walls_2d, polygons = list(shared_memory["walls_2d"]), list(shared_memory["polygons"])
