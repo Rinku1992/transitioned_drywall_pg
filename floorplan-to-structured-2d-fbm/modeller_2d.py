@@ -1481,6 +1481,7 @@ class FloorPlan2D(FloorPlan):
         index,
         shared_memory,
         base_canvas=None,
+        model_polygon_override=None,
     ):
         def load_wall_payload(wall_line):
             X1, Y1, X2, Y2 = wall_line[0]
@@ -1508,18 +1509,22 @@ class FloorPlan2D(FloorPlan):
                 [polygon["coordinates"][3]['x'], polygon["coordinates"][3]['y']]
             ], np.int32)
             polygons_pts_normalized.append(pts_normalized)
-        model_polygon = self._model_polygon(
-            vertices,
-            perimeter_walls,
-            area,
-            polygons_pts_normalized,
-            drywall_templates,
-            floor_plan_path,
-            transcription_block_with_centroids,
-            perimeter_walls_unnormalized,
-            height_default=height_default,
-            base_canvas=base_canvas,
-        )
+            # REPLACE WITH:
+        if model_polygon_override is not None:
+            model_polygon = model_polygon_override
+        else:
+            model_polygon = self._model_polygon(
+                vertices,
+                perimeter_walls,
+                area,
+                polygons_pts_normalized,
+                drywall_templates,
+                floor_plan_path,
+                transcription_block_with_centroids,
+                perimeter_walls_unnormalized,
+                height_default=height_default,
+                base_canvas=base_canvas,
+            )
 
         polygon_ids_drywall_interior = list()
         for wall_line, wall_parameter, polygon in zip(perimeter_walls, model_polygon["wall_parameters"], polygons):
@@ -2473,18 +2478,9 @@ class FloorPlan2D(FloorPlan):
             # --- Step 3: Feed results into _add_walls_polygon for wall payload assembly ---
             with Manager() as manager:
                 shared_memory = dict(walls_2d=manager.list(), polygons=manager.list(), lock=manager.Lock())
- 
+
                 for item in all_polygon_data:
                     model_polygon = all_batch_results[item["index"]]
-                    # Call _add_walls_polygon but skip the Gemini call inside it
-                    # We need to feed model_polygon directly — but _add_walls_polygon
-                    # calls _model_polygon internally. So we use the existing method
-                    # with a wrapper that injects the pre-computed result.
-                    #
-                    # Simplest approach: call _add_walls_polygon normally but pass
-                    # model_polygon via a thread-local cache. However, to keep things
-                    # clean and avoid modifying _add_walls_polygon, we replicate the
-                    # wall payload assembly here.
                     self._add_walls_polygon(
                         item["vertices"],
                         item["area_target"],
@@ -2498,7 +2494,9 @@ class FloorPlan2D(FloorPlan):
                         item["index"],
                         shared_memory,
                         base_canvas,
+                        model_polygon,
                     )
+            
  
                 # Perimeter walls (unchanged — these don't use Gemini)
                 for perimeter_line, outer_drywall_surface in zip(perimeter_lines, outer_drywall_surfaces):
