@@ -2424,9 +2424,11 @@ class FloorPlan2D(FloorPlan):
                     base_canvas=base_canvas,
                 ))
  
-            # --- Step 2: Split into batches and call Gemini ---
+            # --- Step 2: Split into batches and call Gemini CONCURRENTLY ---
             all_batch_results = {}  # index → model_polygon dict
  
+            # Build all batches first
+            batches = []
             for batch_start in range(0, len(all_polygon_data), BATCH_SIZE):
                 batch = all_polygon_data[batch_start:batch_start + BATCH_SIZE]
                 batch_indices = [item["index"] for item in batch]
@@ -2436,7 +2438,6 @@ class FloorPlan2D(FloorPlan):
                          batch_size=len(batch),
                          polygon_indices=batch_indices)
  
-                # Build batch_items for _model_polygons_batch
                 batch_items = []
                 for item in batch:
                     batch_items.append(dict(
@@ -2451,29 +2452,44 @@ class FloorPlan2D(FloorPlan):
                         base_canvas=item["base_canvas"],
                     ))
  
-                batch_results = self._model_polygons_batch(batch_items, drywall_templates)
+                batches.append((batch, batch_items))
  
-                # Map results back and handle failures
-                for item, result in zip(batch, batch_results):
-                    if result is not None:
-                        all_batch_results[item["index"]] = result
-                    else:
-                        # Fallback: single call for this polygon
-                        log_json("WARNING", "BATCH_FALLBACK_SINGLE",
-                                 polygon_index=item["index"])
-                        fallback_result = self._model_polygon(
-                            item["vertices"],
-                            item["walls"],
-                            item["area_target"],
-                            item["polygons_pts"],
-                            drywall_templates,
-                            floor_plan_path,
-                            transcription_block_with_centroids,
-                            item["walls_unnormalized"],
-                            height_default=item["height_default"],
-                            base_canvas=base_canvas,
-                        )
-                        all_batch_results[item["index"]] = fallback_result
+            # Run all batches concurrently
+            log_json("INFO", "BATCH_CONCURRENT_START",
+                     n_batches=len(batches),
+                     max_workers=8)
+ 
+            def _process_one_batch(batch_tuple):
+                batch, batch_items = batch_tuple
+                return batch, self._model_polygons_batch(batch_items, drywall_templates)
+ 
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                batch_futures = [executor.submit(_process_one_batch, b) for b in batches]
+ 
+                for future in batch_futures:
+                    batch, batch_results = future.result()
+                    for item, result in zip(batch, batch_results):
+                        if result is not None:
+                            all_batch_results[item["index"]] = result
+                        else:
+                            log_json("WARNING", "BATCH_FALLBACK_SINGLE",
+                                     polygon_index=item["index"])
+                            fallback_result = self._model_polygon(
+                                item["vertices"],
+                                item["walls"],
+                                item["area_target"],
+                                item["polygons_pts"],
+                                drywall_templates,
+                                floor_plan_path,
+                                transcription_block_with_centroids,
+                                item["walls_unnormalized"],
+                                height_default=item["height_default"],
+                                base_canvas=base_canvas,
+                            )
+                            all_batch_results[item["index"]] = fallback_result
+ 
+            log_json("INFO", "BATCH_CONCURRENT_COMPLETE",
+                     total_results=len(all_batch_results))
  
             # --- Step 3: Feed results into _add_walls_polygon for wall payload assembly ---
             with Manager() as manager:
